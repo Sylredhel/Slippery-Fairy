@@ -1,0 +1,124 @@
+name: Build Sylredhel Plugin (Windows & macOS)
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Detect CMake Project & Configure (Windows x64)
+        shell: pwsh
+        run: |
+          if (Test-Path "CMakeLists.txt") {
+            $cmakeFile = Get-Item "CMakeLists.txt"
+          } else {
+            $cmakeFile = Get-ChildItem -Directory |
+              ForEach-Object { Join-Path $_.FullName "CMakeLists.txt" } |
+              Where-Object { Test-Path $_ } |
+              Select-Object -First 1 |
+              ForEach-Object { Get-Item $_ }
+          }
+          if (-not $cmakeFile) { throw "CMakeLists.txt not found." }
+
+          $src = $cmakeFile.DirectoryName
+          $txt = Get-Content $cmakeFile.FullName -Raw
+          if ($txt -notmatch 'project\(\s*([A-Za-z0-9_]+)\s+VERSION\s+([0-9]+\.[0-9]+(?:\.[0-9]+)?)') {
+            throw "Could not parse project name/version from CMakeLists.txt"
+          }
+
+          $target = $Matches[1]
+          $ver    = $Matches[2]
+          "SRC=$src"       | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TARGET=$target" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VER=$ver"       | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          Write-Host "Detected: $target v$ver (src: $src)"
+
+          cmake -S $src -B build -A x64
+
+      - name: Build VST3 (Release)
+        run: cmake --build build --config Release --target ${{ env.TARGET }}_VST3 --parallel
+
+      - name: Stage Windows Distribution (Clean VST3 + readme.txt)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist-win | Out-Null
+          $vst3 = Get-ChildItem -Path "build" -Recurse -Directory -Filter "*.vst3" |
+            Where-Object { $_.FullName -like "*\Release\VST3\*" } |
+            Select-Object -First 1
+          if (-not $vst3) { throw "VST3 bundle not found." }
+          Copy-Item -Path $vst3.FullName -Destination "dist-win/" -Recurse -Force
+          if (Test-Path "$env:SRC/readme.txt") {
+            Copy-Item -Path "$env:SRC/readme.txt" -Destination "dist-win/readme.txt" -Force
+          }
+
+      - name: Upload Windows VST3 Bundle
+        uses: actions/upload-artifact@v5
+        with:
+          name: Sylredhel-${{ env.TARGET }}-v${{ env.VER }}-Windows-VST3
+          path: dist-win/
+          if-no-files-found: error
+
+  build-macos:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Detect CMake Project & Configure (macOS Universal)
+        run: |
+          if [ -f "CMakeLists.txt" ]; then
+            SRC="."
+          else
+            CMAKE_PATH=$(find . -maxdepth 2 -name "CMakeLists.txt" | head -n 1)
+            test -n "$CMAKE_PATH" || (echo "CMakeLists.txt not found" && exit 1)
+            SRC=$(dirname "$CMAKE_PATH")
+          fi
+
+          LINE=$(grep -E '^[[:space:]]*project\(' "$SRC/CMakeLists.txt" | head -n 1)
+          TARGET=$(echo "$LINE" | sed -E 's/.*project\([[:space:]]*([A-Za-z0-9_]+).*/\1/')
+          VER=$(echo "$LINE" | sed -E 's/.*VERSION[[:space:]]+([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/')
+          test -n "$TARGET" && test -n "$VER" || (echo "Could not parse project/version" && exit 1)
+
+          echo "SRC=$SRC"       >> "$GITHUB_ENV"
+          echo "TARGET=$TARGET" >> "$GITHUB_ENV"
+          echo "VER=$VER"       >> "$GITHUB_ENV"
+          echo "Detected: $TARGET v$VER (src: $SRC)"
+
+          cmake -S "$SRC" -B build -G Xcode \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
+
+      - name: Build VST3 & AU (Release, Universal)
+        run: |
+          cmake --build build --config Release --target ${{ env.TARGET }}_VST3 --parallel
+          cmake --build build --config Release --target ${{ env.TARGET }}_AU --parallel
+
+      - name: Ad-Hoc Sign & Stage macOS Distribution
+        run: |
+          mkdir -p dist-mac
+          VST3_PATH=$(find build -type d -path "*/Release/VST3/*.vst3" | head -n 1)
+          AU_PATH=$(find build -type d -path "*/Release/AU/*.component" | head -n 1)
+          test -n "$VST3_PATH" || (echo "VST3 bundle not found" && exit 1)
+          test -n "$AU_PATH" || (echo "AU component not found" && exit 1)
+          cp -R "$VST3_PATH" dist-mac/
+          cp -R "$AU_PATH" dist-mac/
+          codesign --force --deep --sign - "dist-mac/$(basename "$VST3_PATH")"
+          codesign --force --deep --sign - "dist-mac/$(basename "$AU_PATH")"
+          if [ -f "$SRC/readme.txt" ]; then
+            cp "$SRC/readme.txt" dist-mac/readme.txt
+          fi
+
+      - name: Upload macOS Universal VST3 & AU Bundle
+        uses: actions/upload-artifact@v5
+        with:
+          name: Sylredhel-${{ env.TARGET }}-v${{ env.VER }}-macOS-VST3-AU
+          path: dist-mac/
+          if-no-files-found: error
